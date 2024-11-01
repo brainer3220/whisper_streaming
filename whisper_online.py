@@ -534,7 +534,11 @@ class VACOnlineASRProcessor(OnlineASRProcessor):
             repo_or_dir='snakers4/silero-vad',
             model='silero_vad'
         )
+<<<<<<< HEAD
         from silero_vad import VADIterator, FixedVADIterator
+=======
+        from silero_vad import FixedVADIterator
+>>>>>>> 51ef585e4bf4ffad91f234e703c6e790e07905f9
         self.vac = FixedVADIterator(model)  # we use all the default options: 500ms silence, etc.  
 
         self.logfile = self.online.logfile
