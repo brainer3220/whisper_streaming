@@ -6,6 +6,7 @@ import argparse
 import os
 import logging
 import numpy as np
+import threading  # Import threading module
 
 logger = logging.getLogger(__name__)
 parser = argparse.ArgumentParser()
@@ -20,40 +21,53 @@ parser.add_argument("--warmup-file", type=str, dest="warmup_file",
 add_shared_args(parser)
 args = parser.parse_args()
 
-set_logging(args,logger,other="")
+set_logging(args, logger, other="")
 
-# setting whisper object by args 
-
+# Constants
 SAMPLING_RATE = 16000
 
-size = args.model
-language = args.lan
-asr, online = asr_factory(args)
-min_chunk = args.min_chunk_size
+# Function to handle each client connection
+def handle_client(conn, addr):
+    logger.info(f'Connected to client on {addr}')
 
-# warm up the ASR because the very first transcribe takes more time than the others. 
-# Test results in https://github.com/ufal/whisper_streaming/pull/81
-msg = "Whisper is not warmed up. The first chunk processing may take longer."
-if args.warmup_file:
-    if os.path.isfile(args.warmup_file):
-        a = load_audio_chunk(args.warmup_file,0,1)
-        asr.transcribe(a)
-        logger.info("Whisper is warmed up.")
+    # Initialize ASR and online instances per connection
+    asr, online = asr_factory(args)
+
+    # Warm up the ASR if a warmup file is provided
+    if args.warmup_file:
+        if os.path.isfile(args.warmup_file):
+            a = load_audio_chunk(args.warmup_file, 0, 1)
+            asr.transcribe(a)
+            logger.info(f"Whisper is warmed up for client {addr}")
+        else:
+            logger.critical(f"The warm up file is not available for client {addr}. Terminating connection.")
+            conn.close()
+            return
     else:
-        logger.critical("The warm up file is not available. "+msg)
-        sys.exit(1)
-else:
-    logger.warning(msg)
+        logger.warning("Whisper is not warmed up. The first chunk processing may take longer.")
 
+    connection = Connection(conn)
+    proc = ServerProcessor(connection, online, args.min_chunk_size)
+
+    try:
+        proc.process()
+    except Exception as e:
+        logger.error(f"Error processing client {addr}: {e}")
+    finally:
+        conn.close()
+        logger.info(f'Connection to client {addr} closed')
 
 ######### Server objects
 
 import line_packet
 import socket
+import io
+import soundfile
+import librosa
 
 class Connection:
-    '''it wraps conn object'''
-    PACKET_SIZE = 32000*5*60 # 5 minutes # was: 65536
+    '''It wraps conn object'''
+    PACKET_SIZE = 32000*5*60  # 5 minutes
 
     def __init__(self, conn):
         self.conn = conn
@@ -62,7 +76,7 @@ class Connection:
         self.conn.setblocking(True)
 
     def send(self, line):
-        '''it doesn't send the same line twice, because it was problematic in online-text-flow-events'''
+        '''It doesn't send the same line twice to prevent duplicates'''
         if line == self.last_line:
             return
         line_packet.send_one_line(self.conn, line)
@@ -79,12 +93,8 @@ class Connection:
         except ConnectionResetError:
             return None
 
-
-import io
-import soundfile
-
-# wraps socket and ASR object, and serves one client connection. 
-# next client should be served by a new instance of this object
+# Wraps socket and ASR object, and serves one client connection.
+# Next client should be served by a new instance of this object
 class ServerProcessor:
 
     def __init__(self, c, online_asr_proc, min_chunk):
@@ -97,18 +107,17 @@ class ServerProcessor:
         self.is_first = True
 
     def receive_audio_chunk(self):
-        # receive all audio that is available by this time
-        # blocks operation if less than self.min_chunk seconds is available
-        # unblocks if connection is closed or a chunk is available
+        # Receive all audio that is available by this time
+        # Blocks operation if less than self.min_chunk seconds is available
+        # Unblocks if connection is closed or a chunk is available
         out = []
-        minlimit = self.min_chunk*SAMPLING_RATE
+        minlimit = self.min_chunk * SAMPLING_RATE
         while sum(len(x) for x in out) < minlimit:
             raw_bytes = self.connection.non_blocking_receive_audio()
             if not raw_bytes:
                 break
-#            print("received audio:",len(raw_bytes), "bytes", raw_bytes[:10])
-            sf = soundfile.SoundFile(io.BytesIO(raw_bytes), channels=1,endian="LITTLE",samplerate=SAMPLING_RATE, subtype="PCM_16",format="RAW")
-            audio, _ = librosa.load(sf,sr=SAMPLING_RATE,dtype=np.float32)
+            sf = soundfile.SoundFile(io.BytesIO(raw_bytes), channels=1, endian="LITTLE", samplerate=SAMPLING_RATE, subtype="PCM_16", format="RAW")
+            audio, _ = librosa.load(sf, sr=SAMPLING_RATE, dtype=np.float32)
             out.append(audio)
         if not out:
             return None
@@ -118,26 +127,22 @@ class ServerProcessor:
         self.is_first = False
         return np.concatenate(out)
 
-    def format_output_transcript(self,o):
-        # output format in stdout is like:
+    def format_output_transcript(self, o):
+        # Output format in stdout is like:
         # 0 1720 Takhle to je
-        # - the first two words are:
-        #    - beg and end timestamp of the text segment, as estimated by Whisper model. The timestamps are not accurate, but they're useful anyway
-        # - the next words: segment transcript
-
-        # This function differs from whisper_online.output_transcript in the following:
-        # succeeding [beg,end] intervals are not overlapping because ELITR protocol (implemented in online-text-flow events) requires it.
-        # Therefore, beg, is max of previous end and current beg outputed by Whisper.
-        # Usually it differs negligibly, by appx 20 ms.
+        # - The first two numbers are:
+        #    - Begin and end timestamp of the text segment, as estimated by Whisper model.
+        #      The timestamps are not accurate, but they're useful anyway.
+        # - The next words: segment transcript
 
         if o[0] is not None:
-            beg, end = o[0]*1000,o[1]*1000
+            beg, end = o[0]*1000, o[1]*1000
             if self.last_end is not None:
                 beg = max(beg, self.last_end)
 
             self.last_end = end
-            print("%1.0f %1.0f %s" % (beg,end,o[2]),flush=True,file=sys.stderr)
-            return "%1.0f %1.0f %s" % (beg,end,o[2])
+            print("%1.0f %1.0f %s" % (beg, end, o[2]), flush=True, file=sys.stderr)
+            return "%1.0f %1.0f %s" % (beg, end, o[2])
         else:
             logger.debug("No text in this segment")
             return None
@@ -148,37 +153,39 @@ class ServerProcessor:
             self.connection.send(msg)
 
     def process(self):
-        # handle one client connection
+        # Handle one client connection
         self.online_asr_proc.init()
         while True:
             a = self.receive_audio_chunk()
             if a is None:
                 break
             self.online_asr_proc.insert_audio_chunk(a)
-            o = online.process_iter()
+            o = self.online_asr_proc.process_iter()
             try:
                 self.send_result(o)
             except BrokenPipeError:
-                logger.info("broken pipe -- connection closed?")
+                logger.info("Broken pipe -- connection closed?")
                 break
 
-#        o = online.finish()  # this should be working
-#        self.send_result(o)
+        # Optionally, finish processing
+        # o = self.online_asr_proc.finish()
+        # self.send_result(o)
 
-
-
-# server loop
-
+# Server loop with threading
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Reuse address
     s.bind((args.host, args.port))
-    s.listen(1)
-    logger.info('Listening on'+str((args.host, args.port)))
-    while True:
-        conn, addr = s.accept()
-        logger.info('Connected to client on {}'.format(addr))
-        connection = Connection(conn)
-        proc = ServerProcessor(connection, online, args.min_chunk_size)
-        proc.process()
-        conn.close()
-        logger.info('Connection to client closed')
-logger.info('Connection closed, terminating.')
+    s.listen(10)  # Increased backlog to allow more pending connections
+    logger.info(f'Listening on {args.host}:{args.port}')
+
+    try:
+        while True:
+            conn, addr = s.accept()
+            client_thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            client_thread.start()
+    except KeyboardInterrupt:
+        logger.info("Server is shutting down.")
+    except Exception as e:
+        logger.error(f"An error occurred: {e}")
+
+logger.info('Server terminated.')
