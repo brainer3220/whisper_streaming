@@ -3,32 +3,57 @@ import sys
 import argparse
 import os
 import logging
-import numpy as np
-import asyncio  # Import asyncio for asynchronous I/O
+from logging.handlers import RotatingFileHandler
+import structlog
+import asyncio
 import soundfile
 import io
 import librosa
-
-# Assuming whisper_online and asr_factory are correctly imported
 from whisper_online import *
 
-logger = logging.getLogger(__name__)
-parser = argparse.ArgumentParser()
-
-# Server options
-parser.add_argument("--host", type=str, default='localhost')
-parser.add_argument("--port", type=int, default=43007)
-parser.add_argument("--warmup-file", type=str, dest="warmup_file",
-                    help="The path to a speech audio wav file to warm up Whisper so that the very first chunk processing is fast. It can be e.g. https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav .")
-
-# Options from whisper_online
-add_shared_args(parser)
-args = parser.parse_args()
-
-set_logging(args, logger, other="")
-
-# Constants
-SAMPLING_RATE = 16000
+# Function to configure structlog
+def configure_structlog(args):
+    """
+    Configures structlog with appropriate processors and handlers.
+    """
+    # Determine logging level based on mode
+    if args.mode == "production":
+        log_level = logging.INFO
+        log_file = "app.log"
+    else:
+        log_level = logging.DEBUG
+        log_file = "app_debug.log"
+    
+    # Configure standard logging
+    logging.basicConfig(
+        level=log_level,
+        format="%(message)s",  # structlog will handle formatting
+        handlers=[
+            RotatingFileHandler(
+                log_file,
+                maxBytes=5 * 1024 * 1024,  # 5 MB
+                backupCount=5,
+            ),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    
+    # Configure structlog
+    structlog.configure(
+        processors=[
+            structlog.stdlib.filter_by_level,  # Filter logs based on level
+            structlog.stdlib.add_logger_name,  # Add logger name
+            structlog.stdlib.add_log_level,    # Add log level
+            structlog.processors.TimeStamper(fmt="iso"),  # Add timestamp
+            structlog.processors.JSONRenderer(),  # Render logs as JSON
+            # If you prefer human-readable logs, use ConsoleRenderer
+            # structlog.processors.ConsoleRenderer(),
+        ],
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
 
 # Helper functions for encoding and decoding lines
 def encode_line(line: str) -> bytes:
@@ -39,8 +64,30 @@ def decode_line(data: bytes) -> str:
     """Decodes bytes into a string, stripping the newline delimiter."""
     return data.decode('utf-8').rstrip('\n')
 
-# Warm up the ASR because the very first transcribe takes more time than the others.
-# Test results in https://github.com/ufal/whisper_streaming/pull/81
+# Argument parsing
+parser = argparse.ArgumentParser()
+
+# Example arguments
+parser.add_argument("--mode", type=str, default="development", choices=["production", "development"], help="Run mode.")
+parser.add_argument("--host", type=str, default='localhost', help="Host to bind the server.")
+parser.add_argument("--port", type=int, default=43007, help="Port to bind the server.")
+parser.add_argument("--warmup-file", type=str, dest="warmup_file",
+                    help="The path to a speech audio wav file to warm up Whisper so that the very first chunk processing is fast.")
+# Add other arguments as needed
+add_shared_args(parser)  # Assuming this function adds more arguments
+
+args = parser.parse_args()
+
+# Configure structlog
+configure_structlog(args)
+
+# Obtain a structlog logger
+logger = structlog.get_logger(__name__)
+
+# Constants
+SAMPLING_RATE = 16000
+
+# Warm up the ASR if a warmup file is provided
 msg = "Whisper is not warmed up. The first chunk processing may take longer."
 if args.warmup_file:
     if os.path.isfile(args.warmup_file):
@@ -56,8 +103,6 @@ else:
     logger.warning(msg)
 
 ######### Server objects
-
-# Removed line_packet import
 
 class Connection:
     '''It wraps reader and writer objects for asyncio'''
@@ -125,8 +170,16 @@ class ServerProcessor:
                 beg = max(beg, self.last_end)
 
             self.last_end = end
-            print("%1.0f %1.0f %s" % (beg, end, o[2]), flush=True, file=sys.stderr)
-            return "%1.0f %1.0f %s" % (beg, end, o[2])
+            # Structured logging as a dictionary
+            log_message = {
+                "beg": f"{beg:.0f}",
+                "end": f"{end:.0f}",
+                "transcript": o[2]
+            }
+            # Log as structured data
+            logger.info("Transcription", **log_message)
+            # Return a formatted string for sending to the client
+            return f"{beg:.0f} {end:.0f} {o[2]}"
         else:
             logger.debug("No text in this segment")
             return None
@@ -157,7 +210,7 @@ class ServerProcessor:
 
 async def handle_client(reader, writer):
     addr = writer.get_extra_info('peername')
-    logger.info(f'Connected to client on {addr}')
+    logger.info("New connection", client=addr)
 
     connection = Connection(reader, writer)
     processor = ServerProcessor(connection, args)
@@ -165,18 +218,18 @@ async def handle_client(reader, writer):
     try:
         await processor.process()
     except Exception as e:
-        logger.error(f"Error processing client {addr}: {e}")
+        logger.error("Error processing client", client=addr, error=str(e))
     finally:
         writer.close()
         await writer.wait_closed()
-        logger.info(f'Connection to client {addr} closed')
+        logger.info("Connection closed", client=addr)
 
 async def main():
     server = await asyncio.start_server(
         handle_client, args.host, args.port
     )
     addr = server.sockets[0].getsockname()
-    logger.info(f'Listening on {addr}')
+    logger.info("Server started", address=addr)
 
     async with server:
         try:
@@ -184,9 +237,9 @@ async def main():
         except KeyboardInterrupt:
             logger.info("Server is shutting down.")
         except Exception as e:
-            logger.error(f"An error occurred: {e}")
+            logger.error("Server encountered an error", error=str(e))
 
-    logger.info('Server terminated.')
+    logger.info("Server terminated.")
 
 if __name__ == '__main__':
     asyncio.run(main())
