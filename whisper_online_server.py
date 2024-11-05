@@ -10,6 +10,9 @@ import soundfile
 import io
 import librosa
 from whisper_online import *
+import datetime
+import uuid
+import numpy as np  # Ensure numpy is imported
 
 # Function to configure structlog
 def configure_structlog(args):
@@ -139,7 +142,7 @@ class Connection:
 
 class ServerProcessor:
 
-    def __init__(self, connection, args):
+    def __init__(self, connection, args, addr):
         self.connection = connection
         self.min_chunk = args.min_chunk_size
         self.last_end = None
@@ -148,14 +151,51 @@ class ServerProcessor:
         # Initialize ASR and online instances per connection
         self.asr, self.online_asr_proc = asr_factory(args)
 
+        # Generate a unique filename using client address and timestamp
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        unique_id = uuid.uuid4().hex  # Ensures uniqueness even if multiple connections from same addr
+        client_ip, client_port = addr
+        
+        AUDIO_DIR = "received_audios"
+        os.makedirs(AUDIO_DIR, exist_ok=True)
+        self.audio_filename = os.path.join(
+            AUDIO_DIR,
+            f"audio_{client_ip}_{client_port}_{timestamp}_{unique_id}.wav"
+        )
+
+        try:
+            self.audio_file = soundfile.SoundFile(
+                self.audio_filename,
+                mode='w',
+                samplerate=SAMPLING_RATE,
+                channels=1,
+                subtype='PCM_16',
+                format='WAV'
+            )
+            logger.info("Audio file created", filename=self.audio_filename, client=addr)
+        except Exception as e:
+            logger.error("Failed to create audio file", error=str(e))
+            raise
+
     async def receive_audio_chunk(self):
         raw_bytes = await self.connection.receive_audio(self.min_chunk)
         if not raw_bytes:
             return None
         # Convert raw bytes to audio data
-        sf = soundfile.SoundFile(io.BytesIO(raw_bytes), channels=1, endian="LITTLE",
-                                 samplerate=SAMPLING_RATE, subtype="PCM_16", format="RAW")
-        audio, _ = librosa.load(sf, sr=SAMPLING_RATE, dtype=np.float32)
+        try:
+            sf_obj = soundfile.SoundFile(io.BytesIO(raw_bytes), channels=1, endian="LITTLE",
+                                         samplerate=SAMPLING_RATE, subtype="PCM_16", format="RAW")
+            audio, _ = librosa.load(sf_obj, sr=SAMPLING_RATE, dtype=np.float32)
+        except Exception as e:
+            logger.error("Failed to process audio chunk", error=str(e))
+            return None
+
+        # Write the audio chunk to the file
+        try:
+            self.audio_file.write(audio)
+        except Exception as e:
+            logger.error("Failed to write audio chunk to file", error=str(e))
+
         if self.is_first and len(audio) < self.min_chunk * SAMPLING_RATE:
             return None
         self.is_first = False
@@ -192,28 +232,38 @@ class ServerProcessor:
     async def process(self):
         # Handle one client connection
         self.online_asr_proc.init()
-        while True:
-            a = await self.receive_audio_chunk()
-            if a is None:
-                break
-            self.online_asr_proc.insert_audio_chunk(a)
-            o = self.online_asr_proc.process_iter()
-            try:
-                await self.send_result(o)
-            except ConnectionResetError:
-                logger.info("Connection reset -- connection closed?")
-                break
+        try:
+            while True:
+                a = await self.receive_audio_chunk()
+                if a is None:
+                    break
+                self.online_asr_proc.insert_audio_chunk(a)
+                o = self.online_asr_proc.process_iter()
+                try:
+                    await self.send_result(o)
+                except ConnectionResetError:
+                    logger.info("Connection reset -- connection closed?")
+                    break
+        except Exception as e:
+            logger.error("Error during processing", error=str(e))
+        finally:
+            # Optionally, finish processing
+            # o = self.online_asr_proc.finish()
+            # await self.send_result(o)
 
-        # Optionally, finish processing
-        # o = self.online_asr_proc.finish()
-        # await self.send_result(o)
+            # Close the audio file
+            try:
+                self.audio_file.close()
+                logger.info("Audio file closed", filename=self.audio_filename)
+            except Exception as e:
+                logger.error("Failed to close audio file", error=str(e))
 
 async def handle_client(reader, writer):
     addr = writer.get_extra_info('peername')
     logger.info("New connection", client=addr)
 
     connection = Connection(reader, writer)
-    processor = ServerProcessor(connection, args)
+    processor = ServerProcessor(connection, args, addr)
 
     try:
         await processor.process()
