@@ -191,10 +191,10 @@ class ServerProcessor:
             return None
 
         # Write the audio chunk to the file
-        try:
-            self.audio_file.write(audio)
-        except Exception as e:
-            logger.error("Failed to write audio chunk to file", error=str(e))
+        # try:
+        #     self.audio_file.write(audio)
+        # except Exception as e:
+        #     logger.error("Failed to write audio chunk to file", error=str(e))
 
         if self.is_first and len(audio) < self.min_chunk * SAMPLING_RATE:
             return None
