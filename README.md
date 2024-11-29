@@ -10,7 +10,7 @@ Whisper 스트리밍 서버를 설정하고 실행하려면 다음 단계를 따
 
    ```bash
    cd VMR-Server
-   git clone https://github.com/brainer3220?tab=repositories
+   git clone https://github.com/brainer3220/whisper_streaming
    ```
 
 2. **`whisper_streaming`**\*\* 디렉토리로 이동\*\*
