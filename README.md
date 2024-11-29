@@ -23,6 +23,14 @@ Whisper 스트리밍 서버를 설정하고 실행하려면 다음 단계를 따
 
 3. **Whisper 온라인 서버 실행**
 
+4. **tmux 세션 생성**
+
+   Whisper 서버를 실행하기 전에 새로운 tmux 세션을 생성합니다:
+
+   ```bash
+   tmux new -s vmr-realtime
+   ```
+
    다음 옵션을 사용하여 Poetry로 Whisper 온라인 서버 스크립트를 실행합니다:
 
    - 언어를 한국어로 설정 (`--language ko`)
