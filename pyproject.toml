@@ -10,4 +10,6 @@ dependencies = [
     "mlx-whisper>=0.4.2",
     "soundfile>=0.13.1",
     "structlog>=25.4.0",
+    "torchaudio>=2.7.1",
+    "transformers>=4.53.2",
 ]
