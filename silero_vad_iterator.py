@@ -4,14 +4,20 @@ import soundfile as sf
 import librosa
 from transformers import Wav2Vec2Processor, HubertModel
 
+# This is copied from silero-vad's vad_utils.py:
+# https://github.com/snakers4/silero-vad/blob/94811cbe1207ec24bc0f5370b895364b8934936f/src/silero_vad/utils_vad.py#L398C1-L489C20
+# (except changed defaults)
+
+# Their licence is MIT, same as ours: https://github.com/snakers4/silero-vad/blob/94811cbe1207ec24bc0f5370b895364b8934936f/LICENSE
+
 # Silero VADIterator 클래스 정의
 class VADIterator:
     def __init__(self,
                  model,
                  threshold: float = 0.5,
                  sampling_rate: int = 16000,
-                 min_silence_duration_ms: int = 100,
-                 speech_pad_ms: int = 30
+                 min_silence_duration_ms: int = 500,  # makes sense on one recording that I checked
+                 speech_pad_ms: int = 100             # same 
                  ):
 
         """
@@ -53,13 +59,17 @@ class VADIterator:
         self.temp_end = 0
         self.current_sample = 0
 
-    def __call__(self, x, return_seconds=False):
+    @torch.no_grad()
+    def __call__(self, x, return_seconds=False, time_resolution: int = 1):
         """
         x: torch.Tensor
             오디오 청크
 
-        return_seconds: bool (기본값 - False)
-            타임스탬프를 초 단위로 반환할지 여부
+        return_seconds: bool (default - False)
+            whether return timestamps in seconds (default - samples)
+
+        time_resolution: int (default - 1)
+            time resolution of speech coordinates when requested as seconds
         """
 
         if not torch.is_tensor(x):
@@ -78,8 +88,8 @@ class VADIterator:
 
         if (speech_prob >= self.threshold) and not self.triggered:
             self.triggered = True
-            speech_start = self.current_sample - self.speech_pad_samples
-            return {'start': int(speech_start) if not return_seconds else round(speech_start / self.sampling_rate, 1)}
+            speech_start = max(0, self.current_sample - self.speech_pad_samples - window_size_samples)
+            return {'start': int(speech_start) if not return_seconds else round(speech_start / self.sampling_rate, time_resolution)}
 
         if (speech_prob < self.threshold - 0.15) and self.triggered:
             if not self.temp_end:
@@ -87,27 +97,43 @@ class VADIterator:
             if self.current_sample - self.temp_end < self.min_silence_samples:
                 return None
             else:
-                speech_end = self.temp_end + self.speech_pad_samples
+                speech_end = self.temp_end + self.speech_pad_samples - window_size_samples
                 self.temp_end = 0
                 self.triggered = False
-                return {'end': int(speech_end) if not return_seconds else round(speech_end / self.sampling_rate, 1)}
+                return {'end': int(speech_end) if not return_seconds else round(speech_end / self.sampling_rate, time_resolution)}
 
         return None
 
-# FixedVADIterator 클래스 정의 (Silero VAD의 512 샘플 제한 우회)
+#######################
+# this is our workaround for Silero v5 requiring at least 512-sized audio chunks 
+# (see https://github.com/ufal/whisper_streaming/issues/116 )
+
+import numpy as np
 class FixedVADIterator(VADIterator):
+    '''It fixes VADIterator by allowing to process any audio length, not only exactly 512 frames at once.
+    If audio to be processed at once is long and multiple voiced segments detected, 
+    then __call__ returns the start of the first segment, and end (or middle, which means no end) of the last segment. 
+    '''
 
     def reset_states(self):
         super().reset_states()
         self.buffer = np.array([], dtype=np.float32)
 
     def __call__(self, x, return_seconds=False):
-        self.buffer = np.append(self.buffer, x)
-        if len(self.buffer) >= 512:
-            ret = super().__call__(self.buffer, return_seconds=return_seconds)
-            self.buffer = np.array([], dtype=np.float32)
-            return ret
-        return None
+        self.buffer = np.append(self.buffer, x) 
+        ret = None
+        while len(self.buffer) >= 512:
+            r = super().__call__(self.buffer[:512], return_seconds=return_seconds)
+            self.buffer = self.buffer[512:]
+            if ret is None:
+                ret = r
+            elif r is not None:
+                if 'end' in r:
+                    ret['end'] = r['end']  # the latter end
+                if 'start' in r and 'end' in ret:  # there is an earlier start.
+                    # Remove end, merging this segment with the previous one.
+                    del ret['end']
+        return ret if ret != {} else None
 
 def main():
     # Silero VAD 모델 로드
