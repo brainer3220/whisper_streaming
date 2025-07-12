@@ -263,7 +263,14 @@ class MLXWhisper(ASRBase):
         return [s['end'] for s in res]
 
     def use_vad(self):
-        self.transcribe_kargs["vad_filter"] = True
+        import warnings, logging
+        warnings.warn(
+            "mlx-whisper backend does not support --vad yet; "
+            "the option will be ignored.", RuntimeWarning
+        )
+        logging.getLogger(__name__).info(
+            "Ignoring --vad for mlx-whisper (no vad_filter support)."
+        )
 
     def set_translate_task(self):
         self.transcribe_kargs["task"] = "translate"
