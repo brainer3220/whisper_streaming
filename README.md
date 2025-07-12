@@ -31,7 +31,7 @@ Whisper 스트리밍 서버를 설정하고 실행하려면 다음 단계를 따
    tmux new -s vmr-realtime
    ```
 
-   다음 옵션을 사용하여 Poetry로 Whisper 온라인 서버 스크립트를 실행합니다:
+   다음 옵션을 사용하여 uv로 Whisper 온라인 서버 스크립트를 실행합니다:
 
    - 언어를 한국어로 설정 (`--language ko`)
    - 최소 청크 크기를 1로 설정 (`--min-chunk-size 1`)
@@ -42,7 +42,7 @@ Whisper 스트리밍 서버를 설정하고 실행하려면 다음 단계를 따
    다음 명령어를 실행합니다:
 
    ```bash
-   poetry run python whisper_online_server.py --language ko --min-chunk-size 1 --model large-v3-turbo --host 0.0.0.0 --mode production
+   uv run whisper_online_server.py --language ko --min-chunk-size 1 --model large-v3-turbo --host 0.0.0.0 --mode production
    ```
 
 이렇게 하면 Whisper 스트리밍 서버가 설정되고 네트워크에서 접근 가능해집니다.
