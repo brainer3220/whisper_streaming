@@ -7,6 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "faster-whisper>=1.1.1",
     "librosa>=0.11.0",
+    "mlx-whisper>=0.4.2",
     "soundfile>=0.13.1",
     "structlog>=25.4.0",
 ]
